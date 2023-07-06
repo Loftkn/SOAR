@@ -1,0 +1,70 @@
+- hosts: manager
+  become: true
+  tasks:
+    - name: Wait for file to exist
+      stat:
+        path: /tmp/preConfigure.txt
+      register: file_stat
+      until: file_stat.stat.exists
+      retries: 120
+      delay: 30
+
+    - name: Status of Swarm
+      shell: >
+           docker info | egrep 'Swarm: ' | cut -d ' ' -f3
+      register: swarm_status
+   
+    - debug:
+        var: swarm_status
+
+    - name: initialize swarm
+      shell: docker swarm init --advertise-addr $(ip addr show ens01 | grep "inet\b" | awk '{print $2}' | cut -d/ -f1)
+      when: swarm_status.stdout == 'inactive'
+      register: swarm_conf
+
+    - name: retrieve swarm manager token
+      shell: docker swarm join-token -q manager
+      register: swarm_manager_token
+
+        #  - name: retrieve swarm worker token
+        #shell: docker swarm join-token -q worker
+        #when: swarm_conf.changed or swarm_conf.skipped
+        #register: swarm_worker_token
+
+    - name: ip address of manager
+      shell: ip addr show ens01 | grep "inet\b" | awk '{print $2}' | cut -d/ -f1
+      register: show_ip
+
+- hosts: worker-1, worker-2
+  become: true
+  vars:
+    #tokenForClient: "{{ hostvars['manager']['swarm_worker_token'] }}"
+    tokenForManager: "{{ hostvars['manager']['swarm_manager_token'] }}"
+    ipOfManager: "{{ hostvars['manager']['show_ip']['stdout'] }}"
+  tasks:
+    #- debug: var=hostvars['manager']['swarm_worker_token']
+    #- debug: var=hostvars['manager']['swarm_manager_token']
+    - name: join manager nodes to cluster
+      shell: docker swarm join --token={{ tokenForManager['stdout'] }} {{ ipOfManager }}:2377
+      when: tokenForManager.changed
+      register: join_to_cluster
+
+        #- name: join client nodes to cluster
+        #shell: docker swarm join --token={{ tokenForClient['stdout'] }} {{ ipOfManager }}:2377
+        # when: tokenForClient.changed
+
+- hosts: manager
+  become: true
+  vars:
+    statusWork1: "{{ hostvars['worker-1']['join_to_cluster'] }}"
+  tasks:
+    - name: Copy elastic.yml to machine
+      copy:
+       src: /home/kit/diploma-project/ansConfs/elk.yml
+       dest: /home/vmadmin
+
+    - name: Running elastic.yml for creating SOC
+      shell: docker stack deploy -c /home/vmadmin/elk.yml elk 
+      when: statusWork1.changed
+      register: deploying_SOAR
+

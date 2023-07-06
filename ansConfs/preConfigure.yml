@@ -1,0 +1,131 @@
+---
+- name: PreConfigure of nodes
+  hosts: all
+  become: true
+  vars:
+    glusterfs_brick_dir: /data/brick1/glfs0
+    glusterfs_mount_dir: /mnt/glusterfs
+
+  tasks:
+    - name: Wait for file to exist
+      stat:
+        path: /tmp/downloadComplete.txt
+      register: file_stat
+      until: file_stat.stat.exists
+      retries: 60
+      delay: 30
+
+    - name: Enable and start GlusterFS service
+      systemd:
+        name: glusterd
+        enabled: true
+        state: started
+
+    - name: Create GlusterFS brick directory
+      file:
+        path: "{{ glusterfs_brick_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create mount directory
+      file:
+        path: "{{ glusterfs_mount_dir }}"
+        state: directory
+        mode: '0755'
+
+- name: Connecting all nodes to one mount directory
+  hosts: manager
+  become: true
+  vars:
+    glusterfs_brick_dir: /data/brick1/glfs0
+    glusterfs_volume_name: glfs0
+    glusterfs_mount_dir: /mnt/glusterfs
+    glusterfs_replica_count: 2
+  tasks:
+    - name: ip address of manager
+      shell: ip addr show ens01 | grep "inet\b" | awk '{print $2}' | cut -d/ -f1
+      register: show_ip
+
+    - name: Peer probe with other nodes
+      gluster_peer:
+          state: present
+          nodes: "{{ item }}" 
+          force: yes
+      with_items: "{{ groups['servers'] | difference([inventory_hostname]) | map('extract', hostvars, ['ansible_host']) | list }}"
+
+    - name: Create GlusterFS volume
+      gluster_volume:
+        state: present
+        name: "{{ glusterfs_volume_name }}"
+        bricks: "{{ glusterfs_brick_dir }}"
+        replicas: "{{ glusterfs_replica_count }}"
+        cluster: "{{ groups['servers'] | map('extract', hostvars, ['ansible_host']) | list }}"
+        force: yes
+   
+    - name: Start GlusterFS volume
+      gluster_volume:
+        name: "{{ glusterfs_volume_name }}"
+        state: started
+
+- name: Mount clients to servers
+  hosts: all
+  become: true
+  vars:
+    glusterfs_mount_dir: /mnt/glusterfs
+    glusterfs_volume_name: glfs0
+    ipOfManager: "{{ hostvars['manager']['show_ip']['stdout'] }}"
+
+  tasks:
+    - name: Mount GlusterFS volume
+      mount:
+        path: "{{ glusterfs_mount_dir }}"
+        src: "{{ ipOfManager }}:{{ glusterfs_volume_name }}"
+        fstype: glusterfs
+        opts: "defaults,_netdev"
+        state: mounted
+      register: mounting
+
+    - name: Create directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0777'
+      loop:
+        - /mnt/glusterfs/certs
+        - /mnt/glusterfs/esdata
+        - /mnt/glusterfs/kibanadata
+        - /mnt/glusterfs/thehive
+        - /mnt/glusterfs/thehive/data
+        - /mnt/glusterfs/thehive/index
+
+    - name: Copy elastic.yml to machine
+      copy:
+       src: /home/kit/diploma-project/ansConfs/vector.toml
+       dest: /mnt/glusterfs
+
+    - name: Copy Python script
+      copy:
+        src: /home/kit/diploma-project/ansConfs/main.py
+        dest: /usr/local/bin/main.py
+        mode: '0755'
+
+    - name: Add script to crontab
+      cron:
+        name: Run script every 10 minutes
+        minute: "*/10"
+        job: "/usr/local/bin/main.py"
+
+    - name: Stop UFW service
+      service:
+        name: ufw
+        state: stopped
+
+    - name: Disable UFW at boot
+      shell: ufw disable
+
+    - name: Create file in /tmp
+      file:
+        path: /tmp/preConfigure.txt
+        state: touch
+      when: mounting.changed
+      run_once: true

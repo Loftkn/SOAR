@@ -1,0 +1,178 @@
+version: "3.9"
+services:
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.6.2
+    user: "0"
+    deploy:
+      restart_policy:
+        condition: none
+    command: >
+        bash -c '
+          if [ ! -f config/certs/ca.zip ]; then
+            echo "Creating CA";
+            bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+            unzip config/certs/ca.zip -d config/certs;
+          fi;
+          if [ ! -f config/certs/certs.zip ]; then
+            echo "Creating certs";
+            echo -ne \
+            "instances:\n"\
+            "  - name: es01\n"\
+            "    dns:\n"\
+            "      - es01\n"\
+            "      - localhost\n"\
+            "    ip:\n"\
+            "      - 127.0.0.1\n"\
+            "  - name: kibana01\n"\
+            "    dns:\n"\
+            "      - kibana01\n"\
+            "      - localhost\n"\
+            "    ip:\n"\
+            "      - 127.0.0.1\n"\
+            > config/certs/instances.yml;
+            bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+            unzip config/certs/certs.zip -d config/certs;
+          fi;
+          echo "Setting file permissions"
+          chown -R root:root config/certs;
+          echo "Setting kibana password"
+          until curl -s -X POST --cacert config/certs/ca/ca.crt -u "elastic:elastic" -H "Content-Type: application/json" https://es01:9200/_security/user/kibana_system/_password -d "{\"password\":\"kibana\"}" | grep -q "^{}"; do sleep 10; done;
+        '
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/es01/es01.crt ]"]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+    volumes:
+      - /mnt/glusterfs/certs:/usr/share/elasticsearch/config/certs
+
+  es01:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.6.2
+    deploy:
+      endpoint_mode: dnsrr
+      resources:
+        limits:
+          memory: 2G
+    environment:
+      node.name: es01
+      discovery.type: single-node
+      ELASTIC_PASSWORD: elastic
+      cluster.name: docker-cluster
+      bootstrap.memory_lock: "true"
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "true"
+      xpack.security.http.ssl.key: /usr/share/elasticsearch/config/certs/es01/es01.key
+      xpack.security.http.ssl.certificate: /usr/share/elasticsearch/config/certs/es01/es01.crt
+      xpack.security.http.ssl.certificate_authorities: /usr/share/elasticsearch/config/certs/ca/ca.crt
+      xpack.security.transport.ssl.enabled: "true"
+      xpack.security.transport.ssl.key: /usr/share/elasticsearch/config/certs/es01/es01.key
+      xpack.security.transport.ssl.certificate: /usr/share/elasticsearch/config/certs/es01/es01.crt
+      xpack.security.transport.ssl.certificate_authorities: /usr/share/elasticsearch/config/certs/ca/ca.crt
+      xpack.security.transport.ssl.verification_mode: certificate
+      xpack.license.self_generated.type: basic
+      xpack.security.enrollment.enabled: "true"
+        #networks:
+        #- newelk
+    ports:
+      - target: 9200
+        published: 9200
+        protocol: tcp
+        mode: host
+          #ports:
+          #  - 9200:9200
+    volumes:
+      - /mnt/glusterfs/certs:/usr/share/elasticsearch/config/certs
+      - /mnt/glusterfs/esdata:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.6.2
+    deploy:
+      endpoint_mode: dnsrr
+      resources:
+        limits:
+          memory: 2G
+    environment:
+      SERVERNAME: kibana01
+      ELASTICSEARCH_HOSTS: https://es01:9200
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: kibana
+      ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES: /usr/share/kibana/config/certs/ca/ca.crt
+      ELASTICSEARCH_SSL_VERIFICATIONMODE: "none"
+      XPACK_SECURITY_ENABLED: "true"
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: 145723f968410ce2acb49688ab8064a1
+      XPACK_REPORTING_ENCRYPTIONKEY: 7096df88ea08c14d2aa1e3fa103854c8
+      XPACK_SECURITY_ENCRYPTIONKEY: 927f13902b53ec212a0cd08afdcf3b16
+      SERVER_SSL_ENABLED: "true"
+      SERVER_SSL_CERTIFICATE: /usr/share/kibana/config/certs/kibana01/kibana01.crt
+      SERVER_SSL_KEY: /usr/share/kibana/config/certs/kibana01/kibana01.key
+      SERVER_SSL_CERTIFICATEAUTHORITIES: /usr/share/kibana/config/certs/ca/ca.crt
+        #networks:
+        #- newelk
+    ports:
+      - target: 5601
+        published: 5601
+        protocol: tcp
+        mode: host
+        #ports:
+        #  - 5601:5601
+    volumes:
+      - /mnt/glusterfs/certs:/usr/share/kibana/config/certs
+      - /mnt/glusterfs/kibanadata:/usr/share/kibana/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -k -s -I https://localhost:5601 | grep -q 'HTTP/1.1 302 Found'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+
+  vector:
+    image: timberio/vector:0.29.1-debian
+    deploy:
+      endpoint_mode: dnsrr
+      resources:
+        limits:
+          memory: 2G
+    ports:
+      - target: 8686
+        published: 8686
+        protocol: tcp
+        mode: host
+    volumes:
+      - /mnt/glusterfs/certs:/etc/vector/certs
+      - /mnt/glusterfs/vector.toml:/etc/vector/vector.toml
+
+  thehive:
+    image: strangebee/thehive:latest
+    deploy:
+      endpoint_mode: dnsrr
+      resources:
+        limits:
+          memory: 2G
+    ports:
+      - target: 9000
+        published: 9000
+        protocol: tcp
+        mode: host
+    volumes:
+      - /mnt/glusterfs/thehive/data:/opt/thp/thehive/data
+      - /mnt/glusterfs/thehive/index:/opt/thp/thehive/index
+      - /mnt/glusterfs/thehive/:/tmp/thehive-*
+
+networks:
+  newelk:

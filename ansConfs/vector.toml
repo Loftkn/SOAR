@@ -1,0 +1,14 @@
+[sources.logs]
+type = "file"
+include = ["/var/log/dpkg.log"]
+read_from = "beginning"
+
+[sinks.elasticsearch]
+type = "elasticsearch"
+inputs = ["logs"]
+auth.strategy = "basic"
+auth.user = "elastic"
+auth.password = "elastic"
+endpoints = ["https://es01:9200"]
+tls.ca_file = "/etc/vector/certs/ca/ca.crt"
+bulk.index = "logs_test"
